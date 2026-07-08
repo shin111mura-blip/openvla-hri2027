@@ -7,6 +7,7 @@ Core interface script for configuring and initializing RLDS datasets.
 import copy
 import inspect
 import json
+import os
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -33,6 +34,44 @@ overwatch = initialize_overwatch(__name__)
 
 # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch)
 tf.config.set_visible_devices([], "GPU")
+
+
+# OPENVLA_RLDS_DEMO_SPLIT_JSON local patch
+def _load_openvla_rlds_demo_split(dataset_name: str) -> Optional[List[int]]:
+    split_path = os.environ.get("OPENVLA_RLDS_DEMO_SPLIT_JSON")
+    if not split_path:
+        return None
+    with tf.io.gfile.GFile(split_path, "r") as f:
+        split_payload = json.load(f)
+    allowed = []
+    for task in split_payload.get("tasks", {}).values():
+        if isinstance(task, dict):
+            allowed.extend(task.get("selected_global_episode_indices", []))
+    if not allowed:
+        for task in split_payload.get("tasks", []):
+            allowed.extend(task.get("selected_global_episode_indices", []))
+    if not allowed:
+        raise ValueError(
+            f"OPENVLA_RLDS_DEMO_SPLIT_JSON={split_path} has no selected_global_episode_indices "
+            f"for dataset {dataset_name}."
+        )
+    return sorted(set(int(i) for i in allowed))
+
+
+def _apply_openvla_rlds_demo_split(dataset, dataset_name: str):
+    allowed = _load_openvla_rlds_demo_split(dataset_name)
+    if allowed is None:
+        return dataset
+    allowed_tensor = tf.constant(allowed, dtype=tf.int64)
+    overwatch.info(
+        f"Applying OpenVLA RLDS trajectory filter for {dataset_name}: {len(allowed)} trajectories "
+        f"from {os.environ['OPENVLA_RLDS_DEMO_SPLIT_JSON']}"
+    )
+    return (
+        dataset.enumerate()
+        .filter(lambda episode_index, traj: tf.reduce_any(tf.equal(episode_index, allowed_tensor)))
+        .map(lambda episode_index, traj: traj)
+    )
 
 
 # ruff: noqa: B006
@@ -208,7 +247,9 @@ def make_dataset_from_rlds(
     elif dataset_statistics is None:
         full_dataset = dl.DLataset.from_rlds(
             builder, split="all", shuffle=False, num_parallel_reads=num_parallel_reads
-        ).traj_map(restructure, num_parallel_calls)
+        )
+        full_dataset = _apply_openvla_rlds_demo_split(full_dataset, name)
+        full_dataset = full_dataset.traj_map(restructure, num_parallel_calls)
         # tries to load from cache, otherwise computes on the fly
         dataset_statistics = get_dataset_statistics(
             full_dataset,
@@ -216,6 +257,7 @@ def make_dataset_from_rlds(
                 str(builder.info),
                 str(state_obs_keys),
                 inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+                os.environ.get("OPENVLA_RLDS_DEMO_SPLIT_JSON", ""),
             ),
             save_dir=builder.data_dir,
         )
@@ -237,6 +279,7 @@ def make_dataset_from_rlds(
         split = "train" if train else "val"
 
     dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
+    dataset = _apply_openvla_rlds_demo_split(dataset, name)
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
     dataset = dataset.traj_map(

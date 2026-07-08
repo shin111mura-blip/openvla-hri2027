@@ -8,7 +8,7 @@ import numpy as np
 import tensorflow as tf
 import torch
 from PIL import Image
-from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -32,7 +32,7 @@ def get_vla(cfg):
     """Loads and returns a VLA model from checkpoint."""
     # Load VLA checkpoint.
     print("[*] Instantiating Pretrained VLA model")
-    print("[*] Loading in BF16 with Flash-Attention Enabled")
+    print("[*] Loading in BF16 with PyTorch SDPA attention")
 
     # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -40,14 +40,17 @@ def get_vla(cfg):
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    vla = AutoModelForVision2Seq.from_pretrained(
+    config = AutoConfig.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=False, local_files_only=True)
+    vla = OpenVLAForActionPrediction.from_pretrained(
         cfg.pretrained_checkpoint,
-        attn_implementation="flash_attention_2",
+        config=config,
+        attn_implementation="sdpa",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
         load_in_4bit=cfg.load_in_4bit,
         low_cpu_mem_usage=True,
-        trust_remote_code=True,
+        trust_remote_code=False,
+        local_files_only=True,
     )
 
     # Move model to device.
@@ -74,7 +77,14 @@ def get_vla(cfg):
 
 def get_processor(cfg):
     """Get VLA model's Hugging Face processor."""
-    processor = AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
+    image_processor = PrismaticImageProcessor.from_pretrained(cfg.pretrained_checkpoint, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.pretrained_checkpoint,
+        trust_remote_code=False,
+        local_files_only=True,
+        use_fast=False,
+    )
+    processor = PrismaticProcessor(image_processor=image_processor, tokenizer=tokenizer)
     return processor
 
 
