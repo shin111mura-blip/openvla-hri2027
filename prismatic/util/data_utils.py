@@ -14,6 +14,15 @@ from torch.nn.utils.rnn import pad_sequence
 IGNORE_INDEX = -100
 
 
+def _stack_nested(values):
+    first = values[0]
+    if isinstance(first, torch.Tensor):
+        return torch.stack(values)
+    if isinstance(first, dict):
+        return {key: _stack_nested([value[key] for value in values]) for key in first}
+    return values
+
+
 def tree_map(fn: Callable, tree: dict) -> dict:
     """Maps a function over a nested dictionary."""
     return {k: tree_map(fn, v) if isinstance(v, dict) else fn(v) for k, v in tree.items()}
@@ -137,6 +146,33 @@ class PaddedCollatorForActionPrediction:
             attention_mask=attention_mask,
             labels=labels,
         )
+        optional_stack_keys = [
+            "bboxes_normalized",
+            "object_mask",
+            "category_ids",
+            "confidences",
+            "edge_labels",
+            "between_labels",
+            "depth",
+            "graph_targets",
+            "graph_masks",
+        ]
+        for key in optional_stack_keys:
+            if key in instances[0]:
+                output[key] = _stack_nested([instance[key] for instance in instances])
+        passthrough_keys = [
+            "image_id",
+            "task_id",
+            "demo_id",
+            "timestep",
+            "sample_key",
+            "global_episode_index",
+            "rlds_episode_index",
+            "sidecar_lookup_seconds",
+        ]
+        for key in passthrough_keys:
+            if key in instances[0]:
+                output[key] = [instance[key] for instance in instances]
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
         return output

@@ -99,6 +99,11 @@ class GenerateConfig:
     compute_rsa: bool = False                         # Compute referent selection accuracy
     compute_fca: bool = False                         # Compute first contact accuracy
     contact_debug: bool = False                       # Print first-contact debug lines
+    bbox_mode: str = "none"                            # BBox mode: none for main evaluation; full/null are diagnostics
+    save_oracle_scene_graphs: bool = False             # Save simulator-state oracle scene graphs during rollout
+    oracle_scene_graph_sample_every: int = 1           # Save one graph every N simulator timesteps
+    oracle_scene_graph_output_dir: Optional[str] = None # Defaults to output_dir/oracle_scene_graphs
+    save_oracle_scene_graph_rgb: bool = True           # Save RGB frames aligned with graph records
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_project: str = "YOUR_WANDB_PROJECT"        # Name of W&B project to log to (use default!)
@@ -124,6 +129,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
     if "image_aug" in cfg.pretrained_checkpoint:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+    assert cfg.bbox_mode in {"none", "full", "null"}, f"Unsupported bbox_mode={cfg.bbox_mode}"
+    if cfg.bbox_mode == "none":
+        print("[bbox-scene-graph] bbox_mode=none: YOLO, BBox cache, BBox token encoder, and graph heads are disabled.")
+    assert cfg.oracle_scene_graph_sample_every > 0, "oracle_scene_graph_sample_every must be > 0"
 
     # Set random seed
     set_seed_everywhere(cfg.seed)
@@ -178,6 +187,26 @@ def eval_libero(cfg: GenerateConfig) -> None:
             project=cfg.wandb_project,
             name=run_id,
         )
+
+    oracle_graph_tools = None
+    oracle_graph_thresholds = None
+    if cfg.save_oracle_scene_graphs:
+        workspace_root = Path(__file__).resolve().parents[4]
+        scene_graph_dir = workspace_root / "scripts" / "scene_graph"
+        if str(scene_graph_dir) not in sys.path:
+            sys.path.append(str(scene_graph_dir))
+        from oracle_scene_graph_utils import GraphThresholds, append_jsonl, make_graph_record, save_rgb_from_obs
+
+        oracle_graph_tools = {
+            "append_jsonl": append_jsonl,
+            "make_graph_record": make_graph_record,
+            "save_rgb_from_obs": save_rgb_from_obs,
+        }
+        oracle_graph_thresholds = GraphThresholds()
+        oracle_output_dir = Path(cfg.oracle_scene_graph_output_dir or Path(cfg.output_dir) / "oracle_scene_graphs")
+        oracle_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[oracle-scene-graph] saving rollout graphs to {oracle_output_dir}")
+        log_file.write(f"[oracle-scene-graph] saving rollout graphs to {oracle_output_dir}\n")
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -253,6 +282,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
             error_message = ""
             video_path = ""
             contact_tracker = FirstContactTracker(target_object=target_object, object_geoms=object_geoms)
+            oracle_graph_path = None
+            oracle_rgb_dir = None
 
             print(f"Starting episode {task_episodes+1}...")
             log_file.write(f"Starting episode {task_episodes+1}...\n")
@@ -269,6 +300,47 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 obs = env.set_init_state(initial_states[episode_idx])
                 if cfg.compute_rsa or cfg.compute_fca:
                     update_first_contact_tracker(contact_tracker, env, t)
+                if oracle_graph_tools is not None:
+                    oracle_output_dir = Path(cfg.oracle_scene_graph_output_dir or Path(cfg.output_dir) / "oracle_scene_graphs")
+                    oracle_graph_path = (
+                        oracle_output_dir
+                        / "graphs"
+                        / f"task_{task_id:02d}"
+                        / f"trial_{episode_idx:03d}.jsonl"
+                    )
+                    oracle_rgb_dir = oracle_output_dir / "rgb" / f"task_{task_id:02d}" / f"trial_{episode_idx:03d}"
+                    if oracle_graph_path.exists():
+                        oracle_graph_path.unlink()
+
+                def save_oracle_graph_step(current_obs, current_t, event_name=None):
+                    if oracle_graph_tools is None or oracle_graph_path is None:
+                        return
+                    if current_t % cfg.oracle_scene_graph_sample_every != 0 and event_name is None:
+                        return
+                    warnings = []
+                    record = oracle_graph_tools["make_graph_record"](
+                        suite=cfg.task_suite_name,
+                        task_id=task_id,
+                        task_name=getattr(task, "name", str(task_id)),
+                        instruction=task_description,
+                        episode_id=episode_idx,
+                        timestep=current_t,
+                        env=env,
+                        thresholds=oracle_graph_thresholds,
+                        warnings=warnings,
+                        image_width=256,
+                        image_height=256,
+                    )
+                    record["metadata"]["source_note"] = "Recorded live during LIBERO policy rollout from current simulator state."
+                    if event_name is not None:
+                        record["event_name"] = event_name
+                    if cfg.save_oracle_scene_graph_rgb and oracle_rgb_dir is not None:
+                        rgb_path = oracle_rgb_dir / f"t{current_t:06d}.png"
+                        saved = oracle_graph_tools["save_rgb_from_obs"](current_obs, rgb_path)
+                        record["rgb_path"] = str(saved) if saved else None
+                    oracle_graph_tools["append_jsonl"](oracle_graph_path, record)
+
+                save_oracle_graph_step(obs, t, event_name="initial_state")
 
                 while t < max_steps + cfg.num_steps_wait:
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
@@ -278,6 +350,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
                         if cfg.compute_rsa or cfg.compute_fca:
                             update_first_contact_tracker(contact_tracker, env, t)
                         t += 1
+                        if t < cfg.num_steps_wait:
+                            save_oracle_graph_step(obs, t)
                         continue
 
                     # Get preprocessed image
@@ -285,6 +359,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                     # Save preprocessed image for replay video
                     replay_images.append(img)
+                    save_oracle_graph_step(obs, t)
 
                     # Prepare observations dict
                     # Note: OpenVLA does not take proprio state as input
@@ -317,6 +392,7 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     if cfg.compute_rsa or cfg.compute_fca:
                         update_first_contact_tracker(contact_tracker, env, t)
                     if done:
+                        save_oracle_graph_step(obs, t + 1, event_name="done")
                         task_successes += 1
                         total_successes += 1
                         break

@@ -27,6 +27,8 @@ from timm.models.vision_transformer import LayerScale
 from transformers import AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
+from prismatic.vla.token_layout import build_multimodal_with_optional_object_tokens
+
 from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
 
 # Get Logger
@@ -171,6 +173,8 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
 
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
+    object_token_features: Optional[torch.FloatTensor] = None
+    token_layout: Optional[Any] = None
 
 
 class PrismaticPreTrainedModel(PreTrainedModel):
@@ -300,6 +304,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_projector_features: Optional[bool] = None,
+        bbox_token_inputs: Optional[Dict[str, torch.Tensor]] = None,
+        bbox_mode: str = "none",
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
@@ -315,6 +321,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         # Instantiate Placeholder for Projector Features
         projected_patch_embeddings = None
+        object_token_embeddings = None
+        token_layout = None
 
         # Note :: We only support forward passes with the following cases:
         #   => Cached Generation :: (input_ids.shape[1] == 1) and (past_key_values is not None)
@@ -379,26 +387,45 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # Get Input Embeddings (from Language Model Embeddings)
             input_embeddings = self.get_input_embeddings()(input_ids)
 
-            # Build Multimodal Embeddings & Attention Mask =>> Prismatic defaults to inserting after <BOS> token (1:)
-            multimodal_embeddings = torch.cat(
-                [input_embeddings[:, :1, :], projected_patch_embeddings, input_embeddings[:, 1:, :]], dim=1
-            )
-            multimodal_attention_mask = None
-            if attention_mask is not None:
-                multimodal_attention_mask = torch.cat(
-                    [attention_mask[:, :1], projected_patch_attention_mask, attention_mask[:, 1:]], dim=1
+            if bbox_mode not in {"none", "full", "null"}:
+                raise ValueError(f"Unsupported bbox_mode={bbox_mode}")
+            if bbox_mode == "none":
+                bbox_token_inputs = None
+
+            if bbox_token_inputs is not None:
+                if not hasattr(self, "bbox_token_encoder"):
+                    raise AttributeError("bbox_token_inputs were provided but model has no bbox_token_encoder.")
+                if bbox_mode == "null":
+                    bboxes = torch.zeros_like(bbox_token_inputs["bboxes_normalized"])
+                    object_mask = torch.ones_like(bbox_token_inputs["object_mask"], dtype=torch.bool)
+                else:
+                    bboxes = bbox_token_inputs["bboxes_normalized"]
+                    object_mask = bbox_token_inputs["object_mask"].bool()
+                category_ids = bbox_token_inputs.get("category_ids")
+                confidences = bbox_token_inputs.get("confidences")
+                if category_ids is not None:
+                    category_ids = category_ids.to(projected_patch_embeddings.device)
+                if confidences is not None:
+                    confidences = confidences.to(projected_patch_embeddings.device)
+                object_token_embeddings = self.bbox_token_encoder(
+                    projected_patch_embeddings,
+                    bboxes.to(projected_patch_embeddings.device),
+                    object_mask.to(projected_patch_embeddings.device),
+                    category_ids=category_ids,
+                    confidences=confidences,
                 )
 
-            # Build Labels (if specified) =>> Ignore Labels for Patch Embeddings
-            multimodal_labels = None
-            if labels is not None:
-                projected_patch_labels = torch.full(
-                    (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
-                    fill_value=IGNORE_INDEX,
-                    dtype=labels.dtype,
-                    device=labels.device,
+            # Build Multimodal Embeddings & Attention Mask =>> [BOS] [visual] [optional object] [text/action]
+            multimodal_embeddings, multimodal_attention_mask, multimodal_labels, token_layout = (
+                build_multimodal_with_optional_object_tokens(
+                    input_embeddings=input_embeddings,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    projected_patch_embeddings=projected_patch_embeddings,
+                    object_token_embeddings=object_token_embeddings,
+                    object_mask=None if bbox_token_inputs is None else bbox_token_inputs.get("object_mask"),
                 )
-                multimodal_labels = torch.cat([labels[:, :1], projected_patch_labels, labels[:, 1:]], dim=1)
+            )
 
             # Dispatch to Language Model
             language_model_output = self.language_model(
@@ -444,6 +471,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             hidden_states=language_model_output.hidden_states,
             attentions=language_model_output.attentions,
             projector_features=projected_patch_embeddings,
+            object_token_features=object_token_embeddings,
+            token_layout=token_layout,
         )
 
     # === GenerationMixin Methods ===

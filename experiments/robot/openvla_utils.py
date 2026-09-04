@@ -3,10 +3,12 @@
 import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
 import torch
+from peft import PeftModel
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
 
@@ -28,6 +30,55 @@ OPENVLA_V01_SYSTEM_PROMPT = (
 )
 
 
+def _is_peft_adapter_checkpoint(checkpoint: str | os.PathLike) -> bool:
+    checkpoint_path = Path(checkpoint)
+    return (checkpoint_path / "adapter_config.json").is_file() and (
+        checkpoint_path / "adapter_model.safetensors"
+    ).is_file()
+
+
+def _resolve_peft_base_checkpoint(adapter_checkpoint: str | os.PathLike) -> str:
+    adapter_path = Path(adapter_checkpoint)
+    candidates = []
+
+    env_checkpoint = os.environ.get("OPENVLA_BASE_CHECKPOINT") or os.environ.get("OPENVLA_BASE_PATH")
+    if env_checkpoint:
+        candidates.append(Path(env_checkpoint))
+
+    adapter_config_path = adapter_path / "adapter_config.json"
+    if adapter_config_path.is_file():
+        with open(adapter_config_path, "r") as f:
+            adapter_config = json.load(f)
+        adapter_base = adapter_config.get("base_model_name_or_path")
+        if adapter_base:
+            candidates.append(Path(adapter_base))
+
+    candidates.extend(
+        [
+            Path("/workspace/checkpoints/openvla_7b_base_with_libero_spatial_10demo_stats"),
+            Path("/workspace/checkpoints/openvla_7b_base"),
+            Path("checkpoints/openvla_7b_base_with_libero_spatial_10demo_stats"),
+            Path("checkpoints/openvla_7b_base"),
+        ]
+    )
+
+    for candidate in candidates:
+        expanded = candidate.expanduser()
+        if expanded.exists():
+            return str(expanded)
+
+    raise FileNotFoundError(
+        "Could not resolve base OpenVLA checkpoint for PEFT adapter. "
+        "Set OPENVLA_BASE_CHECKPOINT to the local base checkpoint directory."
+    )
+
+
+def _model_checkpoint_for_loading(checkpoint: str | os.PathLike) -> str:
+    if _is_peft_adapter_checkpoint(checkpoint):
+        return _resolve_peft_base_checkpoint(checkpoint)
+    return str(checkpoint)
+
+
 def get_vla(cfg):
     """Loads and returns a VLA model from checkpoint."""
     # Load VLA checkpoint.
@@ -40,9 +91,15 @@ def get_vla(cfg):
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
-    config = AutoConfig.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=False, local_files_only=True)
+    checkpoint = str(cfg.pretrained_checkpoint)
+    is_peft_adapter = _is_peft_adapter_checkpoint(checkpoint)
+    model_checkpoint = _model_checkpoint_for_loading(checkpoint)
+    if is_peft_adapter:
+        print(f"[*] Loading base VLA checkpoint for PEFT adapter: {model_checkpoint}")
+
+    config = AutoConfig.from_pretrained(model_checkpoint, trust_remote_code=False, local_files_only=True)
     vla = OpenVLAForActionPrediction.from_pretrained(
-        cfg.pretrained_checkpoint,
+        model_checkpoint,
         config=config,
         attn_implementation="sdpa",
         torch_dtype=torch.bfloat16,
@@ -52,6 +109,9 @@ def get_vla(cfg):
         trust_remote_code=False,
         local_files_only=True,
     )
+    if is_peft_adapter:
+        print(f"[*] Applying PEFT adapter checkpoint: {checkpoint}")
+        vla = PeftModel.from_pretrained(vla, checkpoint, is_trainable=False)
 
     # Move model to device.
     # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
@@ -60,11 +120,15 @@ def get_vla(cfg):
         vla = vla.to(DEVICE)
 
     # Load dataset stats used during finetuning (for action un-normalization).
-    dataset_statistics_path = os.path.join(cfg.pretrained_checkpoint, "dataset_statistics.json")
+    stats_checkpoint = checkpoint if os.path.isfile(os.path.join(checkpoint, "dataset_statistics.json")) else model_checkpoint
+    dataset_statistics_path = os.path.join(stats_checkpoint, "dataset_statistics.json")
     if os.path.isfile(dataset_statistics_path):
         with open(dataset_statistics_path, "r") as f:
             norm_stats = json.load(f)
         vla.norm_stats = norm_stats
+        if is_peft_adapter:
+            base_vla = vla.get_base_model()
+            base_vla.norm_stats = norm_stats
     else:
         print(
             "WARNING: No local dataset_statistics.json file found for current checkpoint.\n"
@@ -77,9 +141,10 @@ def get_vla(cfg):
 
 def get_processor(cfg):
     """Get VLA model's Hugging Face processor."""
-    image_processor = PrismaticImageProcessor.from_pretrained(cfg.pretrained_checkpoint, local_files_only=True)
+    processor_checkpoint = _model_checkpoint_for_loading(cfg.pretrained_checkpoint)
+    image_processor = PrismaticImageProcessor.from_pretrained(processor_checkpoint, local_files_only=True)
     tokenizer = AutoTokenizer.from_pretrained(
-        cfg.pretrained_checkpoint,
+        processor_checkpoint,
         trust_remote_code=False,
         local_files_only=True,
         use_fast=False,

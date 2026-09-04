@@ -42,12 +42,15 @@ from transformers import AutoConfig, AutoImageProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 import wandb
+from prismatic.models.bbox_token_encoder import BBoxTokenConfig, BBoxTokenEncoder
+from prismatic.models.scene_graph_heads import SceneGraphAuxiliaryHeads, scene_graph_losses
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
 from prismatic.util.data_utils import PaddedCollatorForActionPrediction
 from prismatic.util.torch_utils import set_global_seed
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
+from prismatic.vla.roi_pooling import roi_mean_pool
 
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -55,6 +58,12 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def get_train_core(model):
+    if hasattr(model, "get_base_model"):
+        return model.get_base_model()
+    return model
 
 
 # # === Utilities ===
@@ -111,6 +120,12 @@ class FinetuneConfig:
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
     run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
+    bbox_tokens_enabled: bool = False                               # Insert BBox tokens when batch has BBox inputs
+    scene_graph_enabled: bool = False                               # Enable auxiliary scene graph loss when labels exist
+    bbox_mode: str = "none"                                         # none/full/null
+    max_objects: int = 12                                           # Maximum objects per frame
+    lambda_edge: float = 0.1                                        # Edge loss weight
+    lambda_between: float = 0.1                                     # Between loss weight
 
     # fmt: on
 
@@ -161,7 +176,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Load OpenVLA Processor and Model using HF AutoClasses
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
-    vla = AutoModelForVision2Seq.from_pretrained(
+    vla = OpenVLAForActionPrediction.from_pretrained(
         cfg.vla_path,
         torch_dtype=torch.bfloat16,
         quantization_config=quantization_config,
@@ -190,8 +205,21 @@ def finetune(cfg: FinetuneConfig) -> None:
             with open(run_dir / "lora_config.json", "w") as f:
                 json.dump(lora_config.to_dict(), f, indent=2, default=str)
 
+    llm_dim = vla.config.text_config.hidden_size
+    train_core = get_train_core(vla)
+    if cfg.bbox_tokens_enabled:
+        train_core.bbox_token_encoder = BBoxTokenEncoder(
+            vision_dim=llm_dim,
+            llm_dim=llm_dim,
+            config=BBoxTokenConfig(enabled=True, max_objects=cfg.max_objects),
+        ).to(device_id)
+    if cfg.scene_graph_enabled:
+        train_core.scene_graph_heads = SceneGraphAuxiliaryHeads(hidden_dim=llm_dim).to(device_id)
+
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+    if cfg.scene_graph_enabled and hasattr(vla, "_set_static_graph"):
+        vla._set_static_graph()
 
     # Create Optimizer =>> note that we default to a simple constant learning rate!
     trainable_params = [param for param in vla.parameters() if param.requires_grad]
@@ -203,6 +231,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             f.write(f"trainable_params: {trainable_param_count}\n")
             f.write(f"total_params: {total_param_count}\n")
             f.write(f"trainable_percent: {100 * trainable_param_count / total_param_count:.6f}\n")
+            for module_name in ["bbox_token_encoder", "scene_graph_heads"]:
+                module = getattr(get_train_core(vla.module if hasattr(vla, "module") else vla), module_name, None)
+                if module is not None:
+                    count = sum(param.numel() for param in module.parameters() if param.requires_grad)
+                    f.write(f"{module_name}_trainable_params: {count}\n")
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -263,6 +296,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                 fieldnames=[
                     "step",
                     "train_loss",
+                    "action_loss",
+                    "edge_loss",
+                    "between_loss",
                     "learning_rate",
                     "grad_norm",
                     "epoch",
@@ -275,6 +311,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_action_losses = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_edge_losses = deque(maxlen=cfg.grad_accumulation_steps)
+    recent_between_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
@@ -285,13 +324,60 @@ def finetune(cfg: FinetuneConfig) -> None:
         completed_gradient_steps = 0
         for batch_idx, batch in enumerate(dataloader):
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                output: CausalLMOutputWithPast = vla(
-                    input_ids=batch["input_ids"].to(device_id),
-                    attention_mask=batch["attention_mask"].to(device_id),
-                    pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-                    labels=batch["labels"],
-                )
-                loss = output.loss
+                bbox_token_inputs = None
+                if "bboxes_normalized" in batch and cfg.bbox_mode != "none":
+                    bbox_token_inputs = {
+                        "bboxes_normalized": batch["bboxes_normalized"].to(device_id),
+                        "object_mask": batch["object_mask"].to(device_id),
+                    }
+                    for optional_key in ["category_ids", "confidences"]:
+                        if optional_key in batch:
+                            bbox_token_inputs[optional_key] = batch[optional_key].to(device_id)
+
+                forward_kwargs = {
+                    "input_ids": batch["input_ids"].to(device_id),
+                    "attention_mask": batch["attention_mask"].to(device_id),
+                    "pixel_values": batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                    "labels": batch["labels"],
+                }
+                if cfg.bbox_tokens_enabled:
+                    forward_kwargs["bbox_token_inputs"] = bbox_token_inputs
+                    forward_kwargs["bbox_mode"] = cfg.bbox_mode
+                if cfg.scene_graph_enabled:
+                    forward_kwargs["output_hidden_states"] = True
+                    forward_kwargs["output_projector_features"] = True
+                output: CausalLMOutputWithPast = vla(**forward_kwargs)
+                action_loss = output.loss
+                edge_loss = action_loss * 0.0
+                between_loss = action_loss * 0.0
+                loss = action_loss
+                if cfg.scene_graph_enabled and "edge_labels" in batch and "between_labels" in batch:
+                    object_mask = batch["object_mask"].to(device_id).bool()
+                    if cfg.bbox_tokens_enabled and output.token_layout is not None and output.token_layout.num_object_tokens:
+                        start = output.token_layout.object_start
+                        stop = start + output.token_layout.num_object_tokens
+                        object_hidden = output.hidden_states[-1][:, start:stop]
+                    else:
+                        visual_hidden = output.hidden_states[-1][
+                            :, 1 : 1 + output.token_layout.num_visual_tokens
+                        ]
+                        object_hidden = roi_mean_pool(
+                            visual_hidden,
+                            batch["bboxes_normalized"].to(device_id),
+                            object_mask,
+                        )
+                    graph_output = get_train_core(vla.module).scene_graph_heads(object_hidden, object_mask)
+                    graph_losses = scene_graph_losses(
+                        graph_output,
+                        batch["edge_labels"].to(device_id),
+                        batch["between_labels"].to(device_id),
+                        object_mask,
+                        lambda_edge=cfg.lambda_edge,
+                        lambda_between=cfg.lambda_between,
+                    )
+                    edge_loss = graph_losses["edge_loss"]
+                    between_loss = graph_losses["between_loss"]
+                    loss = loss + graph_losses["graph_loss"]
 
             # Normalize loss to account for gradient accumulation
             normalized_loss = loss / cfg.grad_accumulation_steps
@@ -300,7 +386,10 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalized_loss.backward()
 
             # Compute Accuracy and L1 Loss for Logging
-            action_logits = output.logits[:, vla.module.vision_backbone.featurizer.patch_embed.num_patches : -1]
+            metric_prefix = vla.module.vision_backbone.featurizer.patch_embed.num_patches
+            if getattr(output, "token_layout", None) is not None:
+                metric_prefix = output.token_layout.num_visual_tokens + output.token_layout.num_object_tokens
+            action_logits = output.logits[:, metric_prefix : -1]
             action_preds = action_logits.argmax(dim=2)
             action_gt = batch["labels"][:, 1:].to(action_preds.device)
             mask = action_gt > action_tokenizer.action_token_begin_idx
@@ -320,6 +409,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # Store recent train metrics
             recent_losses.append(loss.item())
+            recent_action_losses.append(action_loss.item())
+            recent_edge_losses.append(edge_loss.item())
+            recent_between_losses.append(between_loss.item())
             recent_action_accuracies.append(action_accuracy.item())
             recent_l1_losses.append(action_l1_loss.item())
 
@@ -330,6 +422,9 @@ def finetune(cfg: FinetuneConfig) -> None:
             #   =>> Equal to current step metrics when not using gradient accumulation
             #   =>> Otherwise, equal to the average of metrics observed over micro-batches used for gradient accumulation
             smoothened_loss = sum(recent_losses) / len(recent_losses)
+            smoothened_action_loss = sum(recent_action_losses) / len(recent_action_losses)
+            smoothened_edge_loss = sum(recent_edge_losses) / len(recent_edge_losses)
+            smoothened_between_loss = sum(recent_between_losses) / len(recent_between_losses)
             smoothened_action_accuracy = sum(recent_action_accuracies) / len(recent_action_accuracies)
             smoothened_l1_loss = sum(recent_l1_losses) / len(recent_l1_losses)
 
@@ -350,6 +445,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                 wandb.log(
                     {
                         "train_loss": smoothened_loss,
+                        "action_loss": smoothened_action_loss,
+                        "edge_loss": smoothened_edge_loss,
+                        "between_loss": smoothened_between_loss,
                         "action_accuracy": smoothened_action_accuracy,
                         "l1_loss": smoothened_l1_loss,
                         "learning_rate": optimizer.param_groups[0]["lr"],
@@ -363,6 +461,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                         fieldnames=[
                             "step",
                             "train_loss",
+                            "action_loss",
+                            "edge_loss",
+                            "between_loss",
                             "learning_rate",
                             "grad_norm",
                             "epoch",
@@ -375,6 +476,9 @@ def finetune(cfg: FinetuneConfig) -> None:
                         {
                             "step": gradient_step_idx,
                             "train_loss": smoothened_loss,
+                            "action_loss": smoothened_action_loss,
+                            "edge_loss": smoothened_edge_loss,
+                            "between_loss": smoothened_between_loss,
                             "learning_rate": optimizer.param_groups[0]["lr"],
                             "grad_norm": grad_norm,
                             "epoch": "",
@@ -415,7 +519,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 # Merge LoRA weights into model backbone for faster inference
                 #   =>> Note that merging is slow and can be done post-hoc to speed up training
                 if cfg.use_lora:
-                    base_vla = AutoModelForVision2Seq.from_pretrained(
+                    base_vla = OpenVLAForActionPrediction.from_pretrained(
                         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
                     )
                     merged_vla = PeftModel.from_pretrained(base_vla, adapter_dir)

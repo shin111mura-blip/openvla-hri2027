@@ -55,7 +55,24 @@ def _load_openvla_rlds_demo_split(dataset_name: str) -> Optional[List[int]]:
             f"OPENVLA_RLDS_DEMO_SPLIT_JSON={split_path} has no selected_global_episode_indices "
             f"for dataset {dataset_name}."
         )
-    return sorted(set(int(i) for i in allowed))
+    allowed = sorted(set(int(i) for i in allowed))
+    episode_map_path = os.environ.get("OPENVLA_RLDS_EPISODE_MAP_JSON")
+    if not episode_map_path:
+        return allowed
+    with tf.io.gfile.GFile(episode_map_path, "r") as f:
+        episode_map = json.load(f)
+    tfds_to_sidecar = {
+        int(k): int(v)
+        for k, v in episode_map.get("tfds_to_sidecar_global_episode_index", {}).items()
+    }
+    allowed_sidecar = set(allowed)
+    mapped = sorted(tfds_idx for tfds_idx, sidecar_idx in tfds_to_sidecar.items() if sidecar_idx in allowed_sidecar)
+    if not mapped:
+        raise ValueError(
+            f"OPENVLA_RLDS_EPISODE_MAP_JSON={episode_map_path} maps none of the selected sidecar episodes "
+            f"from {split_path} for dataset {dataset_name}."
+        )
+    return mapped
 
 
 def _apply_openvla_rlds_demo_split(dataset, dataset_name: str):
@@ -70,7 +87,7 @@ def _apply_openvla_rlds_demo_split(dataset, dataset_name: str):
     return (
         dataset.enumerate()
         .filter(lambda episode_index, traj: tf.reduce_any(tf.equal(episode_index, allowed_tensor)))
-        .map(lambda episode_index, traj: traj)
+        .map(lambda episode_index, traj: {**traj, "openvla_global_episode_index": episode_index})
     )
 
 
@@ -208,6 +225,8 @@ def make_dataset_from_rlds(
 
         # add timestep info
         new_obs["timestep"] = tf.range(traj_len)
+        if "openvla_global_episode_index" in traj:
+            new_obs["episode_index"] = tf.fill([traj_len], tf.cast(traj["openvla_global_episode_index"], tf.int64))
 
         # extracts `language_key` into the "task" dict
         task = {}
@@ -273,12 +292,19 @@ def make_dataset_from_rlds(
         dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
 
     # construct the dataset
-    if "val" not in builder.info.splits:
+    if os.environ.get("OPENVLA_RLDS_DEMO_SPLIT_JSON"):
+        # Explicit demo splits are authored against TFDS split="train" episode
+        # indices. Slicing with train[:95%] changes the enumerate() order for
+        # some TFDS builders, which breaks BBox/Scene-Graph cache alignment.
+        split = "train"
+    elif "val" not in builder.info.splits:
         split = "train[:95%]" if train else "train[95%:]"
     else:
         split = "train" if train else "val"
 
-    dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
+    # Keep trajectory order stable until after OPENVLA_RLDS_DEMO_SPLIT_JSON filtering.
+    # The split and BBox/Scene-Graph cache use TFDS global episode indices.
+    dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=False, num_parallel_reads=num_parallel_reads)
     dataset = _apply_openvla_rlds_demo_split(dataset, name)
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
